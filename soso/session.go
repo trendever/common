@@ -4,12 +4,10 @@ import (
 	"common/log"
 	"github.com/igm/sockjs-go/sockjs"
 	"sync"
-	"utils/nats"
 )
 
 var Sessions = NewSessionRepository()
-
-const NatsNewSessionSubject = "api.new_session"
+var sessionNotifyFunc = func(uint64) {}
 
 type Session sockjs.Session
 
@@ -37,6 +35,10 @@ type SessionRepositoryImpl struct {
 	users    map[uint64][]Session
 }
 
+func SetSessionNotifyFunc(fn func(uint64)) {
+	sessionNotifyFunc = fn
+}
+
 func (s *SessionRepositoryImpl) Push(session Session, uid uint64) int {
 	s.Lock()
 	defer s.Unlock()
@@ -48,7 +50,7 @@ func (s *SessionRepositoryImpl) Push(session Session, uid uint64) int {
 	if _, ok := s.sessions[session.ID()]; !ok {
 		s.users[uid] = append(sessions, session)
 		s.sessions[session.ID()] = uid
-		nats.StanPublish(NatsNewSessionSubject, uid)
+		sessionNotifyFunc(uid)
 	}
 	log.Debug("Session %s for user %v pushed, total %v", session.ID(), uid, len(s.users[uid]))
 	return len(s.users[uid])
