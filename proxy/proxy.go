@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// build http.Transport for given proxy URL in scheme://user:password@host:port format
 func TransportFromURL(proxyURL string) (ret *http.Transport, err error) {
 	// mostly copy of http.DefaultTransport
 	ret = &http.Transport{
