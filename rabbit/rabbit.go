@@ -61,7 +61,6 @@ type Publisher struct {
 	Exchange Exchange
 	// Publishings can be undeliverable when the mandatory flag is true and no queue is bound that matches the routing key, or when the immediate flag is true and no consumer on the matched queue is ready to accept the delivery.
 	Mandatory    bool
-	Immediate    bool
 	Persistent   bool
 	deliveryMode uint8
 	queryChan    chan pubQuery
@@ -81,10 +80,7 @@ func declareExchange(ch *amqp.Channel, e *Exchange) error {
 }
 
 func (p *Publisher) connLoop(c conn) {
-	defer func() {
-		c.wait.Done()
-		log.Debug("connLoop exited")
-	}()
+	defer c.wait.Done()
 	for {
 		ch, err := c.amqp.Channel()
 		// Most likely something is wrong with connection.
@@ -94,7 +90,7 @@ func (p *Publisher) connLoop(c conn) {
 		} else if err = declareExchange(ch, &p.Exchange); err != nil {
 			// Something is wrong with chanel or whole connection.
 			// Or we are trying to redeclare exchange with incompatible settings, that should be logged.
-			log.Errorf("failed to declare exchange %v: %v", p.Exchange.Name, err)
+			log.Errorf("amqp: failed to declare exchange %v: %v", p.Exchange.Name, err)
 		} else if err = ch.Confirm(false); err != nil {
 			// Probably we do not need to log errors from every chanel in case of troubles with connection
 			// log.Error(err)
@@ -114,6 +110,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 	// @NOTICE I'm not sure about the way to handle troubles with chanel.
 	// We could save all unconfirmed queries and try to send them again later.
 	confirms := ch.NotifyPublish(make(chan amqp.Confirmation))
+	returns := ch.NotifyReturn(make(chan amqp.Return))
 	closes := ch.NotifyClose(make(chan *amqp.Error))
 	// @TODO Specialize ring for pubWaiter type if it will not be used elsewhere
 	// https://pbs.twimg.com/media/DEvvvUoUIAEpAbU.jpg
@@ -131,7 +128,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 				p.Exchange.Name,
 				query.key,
 				p.Mandatory,
-				p.Immediate,
+				false, // rabbit do not support immediate exchanges anyway
 				amqp.Publishing{
 					ContentType:  "application/json",
 					Body:         query.data,
@@ -154,14 +151,33 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 			// We could get here before case below...
 			if confirm.DeliveryTag == 0 {
 				confirms = nil
+				continue
 			}
 			p.handleConfirm(&waiters, confirm)
+		// Message is returned if no route(connected queues) found for mandatory exchanges.
+		case ret := <-returns:
+			// @TODO add callback? idk whether we need it anyway.
+			if ret.ReplyCode == 0 {
+				returns = nil
+				continue
+			}
+			log.Warn("amqp: got return %+v", ret)
 		case err := <-closes:
 			if confirms != nil {
 				// Be sure to read all conforms.
 				for confirm := range confirms {
-					log.Debug("confirm on close: %v", confirm)
+					if confirm.DeliveryTag == 0 {
+						break
+					}
 					p.handleConfirm(&waiters, confirm)
+				}
+			}
+			if returns != nil {
+				for ret := range returns {
+					if ret.ReplyCode == 0 {
+						break
+					}
+					log.Warn("amqp: got return %+v", ret)
 				}
 			}
 			// see notice above
@@ -177,15 +193,21 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 }
 
 func (p *Publisher) handleConfirm(waiters *TagRing, confirm amqp.Confirmation) {
-	// @TODO nack
+	log.Debug("%v: got confirm %v", p.Name, confirm)
 	if !waiters.ContainsTag(confirm.DeliveryTag) {
 		// wtf? Something went really wrong.
 		log.Errorf("amqp: got ack with unexpected tag %v", confirm.DeliveryTag)
 		return
 	}
+
+	var result error
+	if !confirm.Ack { // i'm not even sure when it could happen
+		result = errors.New("broker rejected message")
+	}
+
 	if waiters.FirstTag() == confirm.DeliveryTag {
 		waiter := waiters.Dequeue().(pubWaiter)
-		waiter.query.replyChan <- nil
+		waiter.query.replyChan <- result
 		// Dequeue waiters which got acks earlier from tail of ring.
 		for {
 			iface := waiters.Pick()
@@ -200,7 +222,7 @@ func (p *Publisher) handleConfirm(waiters *TagRing, confirm amqp.Confirmation) {
 		}
 	} else { // Out of order ack. Well, whatever.
 		waiter := waiters.Get(confirm.DeliveryTag).(pubWaiter)
-		waiter.query.replyChan <- nil
+		waiter.query.replyChan <- result
 		// Update waiter in order to prevent extra replies.
 		waiters.Update(confirm.DeliveryTag, pubWaiter{
 			confirmed: true,
@@ -298,10 +320,7 @@ func (c *conn) stop() {
 }
 
 func (c *conn) reconnectLoop(config *Config) {
-	defer func() {
-		c.wait.Done()
-		log.Debug("reconnectLoop exited")
-	}()
+	defer c.wait.Done()
 	for {
 		conn, err := amqp.Dial(config.URL)
 		if err != nil {
