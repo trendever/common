@@ -65,6 +65,7 @@ type Publisher struct {
 	Persistent   bool
 	deliveryMode uint8
 	queryChan    chan pubQuery
+	lock         sync.Mutex
 }
 
 func declareExchange(ch *amqp.Channel, e *Exchange) error {
@@ -80,7 +81,10 @@ func declareExchange(ch *amqp.Channel, e *Exchange) error {
 }
 
 func (p *Publisher) connLoop(c conn) {
-	defer c.wait.Done()
+	defer func() {
+		c.wait.Done()
+		log.Debug("connLoop exited")
+	}()
 	for {
 		ch, err := c.amqp.Channel()
 		// Most likely something is wrong with connection.
@@ -88,7 +92,7 @@ func (p *Publisher) connLoop(c conn) {
 			c.amqp.Close()
 			return
 		} else if err = declareExchange(ch, &p.Exchange); err != nil {
-			/// Something is wrong with chanel or whole connection.
+			// Something is wrong with chanel or whole connection.
 			// Or we are trying to redeclare exchange with incompatible settings, that should be logged.
 			log.Errorf("failed to declare exchange %v: %v", p.Exchange.Name, err)
 		} else if err = ch.Confirm(false); err != nil {
@@ -146,11 +150,19 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 				confirmed: false,
 			})
 		case confirm := <-confirms:
+			// Confirms chan will be closed before notify via closes chan.
+			// We could get here before case below...
+			if confirm.DeliveryTag == 0 {
+				confirms = nil
+			}
 			p.handleConfirm(&waiters, confirm)
 		case err := <-closes:
-			// be sure to read all conforms
-			for confirm := range confirms {
-				p.handleConfirm(&waiters, confirm)
+			if confirms != nil {
+				// Be sure to read all conforms.
+				for confirm := range confirms {
+					log.Debug("confirm on close: %v", confirm)
+					p.handleConfirm(&waiters, confirm)
+				}
 			}
 			// see notice above
 			for iface := waiters.Dequeue(); iface != nil; iface = waiters.Dequeue() {
@@ -165,9 +177,10 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 }
 
 func (p *Publisher) handleConfirm(waiters *TagRing, confirm amqp.Confirmation) {
+	// @TODO nack
 	if !waiters.ContainsTag(confirm.DeliveryTag) {
 		// wtf? Something went really wrong.
-		log.Errorf("amqp: got ack with unexpected tag")
+		log.Errorf("amqp: got ack with unexpected tag %v", confirm.DeliveryTag)
 		return
 	}
 	if waiters.FirstTag() == confirm.DeliveryTag {
@@ -196,11 +209,6 @@ func (p *Publisher) handleConfirm(waiters *TagRing, confirm amqp.Confirmation) {
 }
 
 func Publish(topic, routeKey string, data interface{}) error {
-	select {
-	case <-global.conn.stopper.Chan():
-		return errors.New("connection stopped")
-	default:
-	}
 	pub, ok := global.publishers[topic]
 	if !ok {
 		return errors.New("unknown publish topic")
@@ -208,6 +216,15 @@ func Publish(topic, routeKey string, data interface{}) error {
 	bytes, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal data: %v", err)
+	}
+
+	pub.lock.Lock()
+	defer pub.lock.Unlock()
+
+	select {
+	case <-global.conn.stopper.Chan():
+		return errors.New("connection stopped")
+	default:
 	}
 	replyChan := make(chan error)
 	pub.queryChan <- pubQuery{
@@ -236,41 +253,55 @@ func AddPublishers(pubs ...Publisher) {
 
 type conn struct {
 	amqp    *amqp.Connection
-	wait    sync.WaitGroup
+	wait    *sync.WaitGroup
 	stopper *stopper.Stopper
 }
 
-var global struct {
+var global = struct {
 	conn       *conn
 	publishers map[string]*Publisher
+}{
+	publishers: map[string]*Publisher{},
 }
 
 func Start(config *Config) {
 	global.conn = &conn{
 		stopper: stopper.NewStopper(),
+		wait:    new(sync.WaitGroup),
 	}
 	global.conn.wait.Add(1)
 	go global.conn.reconnectLoop(config)
 }
 
 func Stop() {
-	log.Debug("rabbit: stopping")
+	log.Info("rabbit: stopping")
 	global.conn.stop()
-	log.Debug("rabbit: stopped")
+	log.Info("rabbit: stopped")
 }
 
 func (c *conn) stop() {
 	c.stopper.Stop()
 	c.wait.Wait()
 	for _, pub := range global.publishers {
-		for q := range pub.queryChan {
-			q.replyChan <- errors.New("connection stopped")
+		pub.lock.Lock()
+	QUERIES:
+		for {
+			select {
+			case query := <-pub.queryChan:
+				query.replyChan <- errors.New("connection stopped")
+			default:
+				break QUERIES
+			}
 		}
+		pub.lock.Unlock()
 	}
 }
 
 func (c *conn) reconnectLoop(config *Config) {
-	defer c.wait.Done()
+	defer func() {
+		c.wait.Done()
+		log.Debug("reconnectLoop exited")
+	}()
 	for {
 		conn, err := amqp.Dial(config.URL)
 		if err != nil {
@@ -284,7 +315,7 @@ func (c *conn) reconnectLoop(config *Config) {
 				go pub.connLoop(*c)
 			}
 			select {
-			case err := <- errChan:
+			case err := <-errChan:
 				if err != nil {
 					log.Errorf("rabbit: disconnected: %v", err)
 				}
