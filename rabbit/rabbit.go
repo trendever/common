@@ -109,7 +109,7 @@ func (p *Publisher) connLoop(c conn) {
 func (p *Publisher) chanLoop(ch *amqp.Channel) {
 	// @NOTICE I'm not sure about the way to handle troubles with chanel.
 	// We could save all unconfirmed queries and try to send them again later.
-	confirms := ch.NotifyPublish(make(chan amqp.Confirmation))
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, UnconfirmedPublishLimit))
 	returns := ch.NotifyReturn(make(chan amqp.Return))
 	closes := ch.NotifyClose(make(chan *amqp.Error))
 	// @TODO Specialize ring for pubWaiter type if it will not be used elsewhere
@@ -193,7 +193,6 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 }
 
 func (p *Publisher) handleConfirm(waiters *TagRing, confirm amqp.Confirmation) {
-	log.Debug("%v: got confirm %v", p.Name, confirm)
 	if !waiters.ContainsTag(confirm.DeliveryTag) {
 		// wtf? Something went really wrong.
 		log.Errorf("amqp: got ack with unexpected tag %v", confirm.DeliveryTag)
@@ -241,10 +240,10 @@ func Publish(topic, routeKey string, data interface{}) error {
 	}
 
 	pub.lock.Lock()
-	defer pub.lock.Unlock()
 
 	select {
 	case <-global.conn.stopper.Chan():
+		pub.lock.Unlock()
 		return errors.New("connection stopped")
 	default:
 	}
@@ -254,6 +253,7 @@ func Publish(topic, routeKey string, data interface{}) error {
 		data:      bytes,
 		replyChan: replyChan,
 	}
+	pub.lock.Unlock()
 	return <-replyChan
 }
 
