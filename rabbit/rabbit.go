@@ -56,15 +56,22 @@ type pubWaiter struct {
 }
 
 type Publisher struct {
-	// local name for use in Publish() func
+	// Local name for use in Publish() func.
 	Name     string
 	Exchange Exchange
-	// Publishings can be undeliverable when the mandatory flag is true and no queue is bound that matches the routing key, or when the immediate flag is true and no consumer on the matched queue is ready to accept the delivery.
-	Mandatory    bool
-	Persistent   bool
+	// Publishes can be undeliverable when the mandatory flag is true
+	// and no queue is bound that matches the routing key.
+	// Broker will return message to sender in this case.
+	// @TODO Add callback for returns.
+	Mandatory  bool
+	Persistent bool
+	// @TODO Make conformations optional.
+	// @TODO Way to use default exchange.
+
 	deliveryMode uint8
 	queryChan    chan pubQuery
-	lock         sync.Mutex
+	// @TODO RWLock
+	lock sync.Mutex
 }
 
 func declareExchange(ch *amqp.Channel, e *Exchange) error {
@@ -77,6 +84,19 @@ func declareExchange(ch *amqp.Channel, e *Exchange) error {
 		false,
 		e.Args,
 	)
+}
+
+// If queue have empty name, broker will grant unique name to it. That is what returns.
+func declareQueue(ch *amqp.Channel, q *Queue) (name string, err error) {
+	ret, err := ch.QueueDeclare(
+		q.Name,
+		q.Durable,
+		q.AutoDelete,
+		q.Exclusive,
+		false,
+		q.Args,
+	)
+	return ret.Name, err
 }
 
 func (p *Publisher) connLoop(c conn) {
@@ -257,6 +277,7 @@ func Publish(topic, routeKey string, data interface{}) error {
 	return <-replyChan
 }
 
+// Should be called before Start().
 func AddPublishers(pubs ...Publisher) {
 	for _, pub := range pubs {
 		err := pub.Exchange.Args.Validate()
@@ -273,6 +294,68 @@ func AddPublishers(pubs ...Publisher) {
 	}
 }
 
+type Subscription struct {
+	// @TODO routes
+	// Local name for identify subscription
+	Name    string
+	Queue   Queue
+	AutoAck bool
+	// When exclusive is true, the server will ensure that this is the sole consumer from this queue.
+	Exclusive bool
+	Args      amqp.Table
+
+	Handler interface{}
+}
+
+func (s *Subscription) connLoop(c conn) {
+	defer c.wait.Done()
+	for {
+		ch, err := c.amqp.Channel()
+		// Most likely something is wrong with connection.
+		if err != nil {
+			c.amqp.Close()
+			return
+		} else if name, err := declareQueue(ch, &s.Queue); err != nil {
+			// We are trying to redeclare queue with incompatible settings probably, that should be logged.
+			log.Errorf("amqp: failed to declare queue for '%v': %v", s.Name, err)
+		} else if deliveries, err := ch.Consume(
+			name,
+			"",
+			s.AutoAck,
+			s.Exclusive,
+			false, // rabbit do not support noLocal flag
+			false,
+			s.Args,
+		); err != nil {
+			log.Errorf("amqp: failed to start consume on '%v': %v", s.Name, err)
+		} else {
+			log.Debug("starting consuming(%v)", name)
+			for delivery := range deliveries {
+				// @TODO handle
+				log.Debug("got delivery %+v", delivery)
+			}
+		}
+		ch.Close()
+		select {
+		case <-c.stopper.Chan():
+			return
+		case <-time.After(time.Second * 10):
+		}
+	}
+}
+
+func Subscribe(subscriptions ...Subscription) {
+	for _, sub := range subscriptions {
+		if err := sub.Queue.Args.Validate(); err != nil {
+			log.Fatalf("rabbit: invalid arguments for queue '%v': %v", sub.Queue.Name, err)
+		}
+		if err := sub.Args.Validate(); err != nil {
+			log.Fatalf("rabbit: invalid arguments in subscripiton to queue '%v': %v", sub.Queue.Name, err)
+		}
+		global.subscriptions[sub.Name] = &sub
+	}
+}
+
 type conn struct {
 	amqp    *amqp.Connection
 	wait    *sync.WaitGroup
@@ -280,10 +363,12 @@ type conn struct {
 }
 
 var global = struct {
-	conn       *conn
-	publishers map[string]*Publisher
+	conn          *conn
+	publishers    map[string]*Publisher
+	subscriptions map[string]*Subscription
 }{
-	publishers: map[string]*Publisher{},
+	publishers:    map[string]*Publisher{},
+	subscriptions: map[string]*Subscription{},
 }
 
 func Start(config *Config) {
@@ -332,6 +417,10 @@ func (c *conn) reconnectLoop(config *Config) {
 			for _, pub := range global.publishers {
 				c.wait.Add(1)
 				go pub.connLoop(*c)
+			}
+			for _, sub := range global.subscriptions {
+				c.wait.Add(1)
+				go sub.connLoop(*c)
 			}
 			select {
 			case err := <-errChan:
