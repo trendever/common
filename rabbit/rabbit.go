@@ -73,8 +73,7 @@ type Publisher struct {
 
 	deliveryMode uint8
 	queryChan    chan pubQuery
-	// @TODO RWLock
-	lock sync.Mutex
+	lock sync.RWMutex
 }
 
 func declareExchange(ch *amqp.Channel, e *Exchange) error {
@@ -268,11 +267,11 @@ func Publish(topic, routeKey string, data interface{}) error {
 		return fmt.Errorf("failed to marshal data: %v", err)
 	}
 
-	pub.lock.Lock()
+	pub.lock.RLock()
 
 	select {
 	case <-global.conn.stopper.Chan():
-		pub.lock.Unlock()
+		pub.lock.RUnlock()
 		return errors.New("connection stopped")
 	default:
 	}
@@ -282,7 +281,7 @@ func Publish(topic, routeKey string, data interface{}) error {
 		data:      bytes,
 		replyChan: replyChan,
 	}
-	pub.lock.Unlock()
+	pub.lock.RUnlock()
 	return <-replyChan
 }
 
