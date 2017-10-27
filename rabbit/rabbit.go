@@ -57,8 +57,10 @@ type pubWaiter struct {
 
 type Publisher struct {
 	// Local name for use in Publish() func.
-	Name     string
-	Exchange Exchange
+	Name string
+	// Ignore exchange below and use default one.
+	DefaultExchange bool
+	Exchange        Exchange
 	// Publishes can be undeliverable when the mandatory flag is true
 	// and no queue is bound that matches the routing key.
 	// Broker will return message to sender in this case.
@@ -66,7 +68,6 @@ type Publisher struct {
 	Mandatory  bool
 	Persistent bool
 	// @TODO Make conformations optional.
-	// @TODO Way to use default exchange.
 
 	deliveryMode uint8
 	queryChan    chan pubQuery
@@ -107,14 +108,7 @@ func (p *Publisher) connLoop(c conn) {
 		if err != nil {
 			c.amqp.Close()
 			return
-		} else if err = declareExchange(ch, &p.Exchange); err != nil {
-			// Something is wrong with chanel or whole connection.
-			// Or we are trying to redeclare exchange with incompatible settings, that should be logged.
-			log.Errorf("amqp: failed to declare exchange %v: %v", p.Exchange.Name, err)
-		} else if err = ch.Confirm(false); err != nil {
-			// Probably we do not need to log errors from every chanel in case of troubles with connection
-			// log.Error(err)
-		} else {
+		} else if p.prepareChanel(ch) {
 			p.chanLoop(ch)
 		}
 		ch.Close()
@@ -124,6 +118,19 @@ func (p *Publisher) connLoop(c conn) {
 		case <-time.After(time.Second * 10):
 		}
 	}
+}
+
+func (p *Publisher) prepareChanel(ch *amqp.Channel) bool {
+	if !p.DefaultExchange {
+		err := declareExchange(ch, &p.Exchange)
+		if err != nil {
+			// Something is wrong with chanel or whole connection.
+			// Or we are trying to redeclare exchange with incompatible settings, that should be logged.
+			log.Errorf("amqp: failed to declare exchange %v: %v", p.Exchange.Name, err)
+			return false
+		}
+	}
+	return ch.Confirm(false) == nil
 }
 
 func (p *Publisher) chanLoop(ch *amqp.Channel) {
@@ -283,6 +290,9 @@ func AddPublishers(pubs ...Publisher) {
 		err := pub.Exchange.Args.Validate()
 		if err != nil {
 			log.Fatalf("rabbit: invalid arguments for exchange '%v': %v", pub.Exchange.Name, err)
+		}
+		if pub.DefaultExchange && pub.Exchange.Name != "" {
+			log.Fatalf("rabbit: non-empty exchange with DefaultExchange flag in publisher '%v'", pub.Name)
 		}
 		pub.queryChan = make(chan pubQuery)
 		if pub.Persistent {
