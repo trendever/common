@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/pkg/errors"
 	"github.com/streadway/amqp"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -14,6 +15,7 @@ import (
 // Per topic limit for unconfirmed publishes.
 // Extra queries will not be sent to broker until acks for older messages will have been received.
 const UnconfirmedPublishLimit = 10
+const encodedTrasferMimeType = "application/json"
 
 type Config struct {
 	URL string
@@ -126,7 +128,7 @@ func (p *Publisher) prepareChanel(ch *amqp.Channel) bool {
 		if err != nil {
 			// Something is wrong with chanel or whole connection.
 			// Or we are trying to redeclare exchange with incompatible settings, that should be logged.
-			log.Errorf("amqp: failed to declare exchange %v: %v", p.Exchange.Name, err)
+			log.Errorf("rabbit: failed to declare exchange %v: %v", p.Exchange.Name, err)
 			return false
 		}
 	}
@@ -157,7 +159,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 				p.Mandatory,
 				false, // rabbit do not support immediate exchanges anyway
 				amqp.Publishing{
-					ContentType:  "application/json",
+					ContentType:  encodedTrasferMimeType,
 					Body:         query.data,
 					DeliveryMode: p.deliveryMode,
 				},
@@ -188,7 +190,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 				returns = nil
 				continue
 			}
-			log.Warn("amqp: got return %+v", ret)
+			log.Warn("rabbit: got return %+v", ret)
 		case err := <-closes:
 			if confirms != nil {
 				// Be sure to read all conforms.
@@ -204,7 +206,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 					if ret.ReplyCode == 0 {
 						break
 					}
-					log.Warn("amqp: got return %+v", ret)
+					log.Warn("rabbit: got return %+v", ret)
 				}
 			}
 			// see notice above
@@ -222,7 +224,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 func (p *Publisher) handleConfirm(waiters *TagRing, confirm amqp.Confirmation) {
 	if !waiters.ContainsTag(confirm.DeliveryTag) {
 		// wtf? Something went really wrong.
-		log.Errorf("amqp: got ack with unexpected tag %v", confirm.DeliveryTag)
+		log.Errorf("rabbit: got ack with unexpected tag %v", confirm.DeliveryTag)
 		return
 	}
 
@@ -287,6 +289,9 @@ func Publish(topic, routeKey string, data interface{}) error {
 // Should be called before Start().
 func AddPublishers(pubs ...Publisher) {
 	for _, pub := range pubs {
+		if pub.Name == "" {
+			log.Fatalf("rabbit: empty publisher name")
+		}
 		err := pub.Exchange.Args.Validate()
 		if err != nil {
 			log.Fatalf("rabbit: invalid arguments for exchange '%v': %v", pub.Exchange.Name, err)
@@ -314,7 +319,78 @@ type Subscription struct {
 	Exclusive bool
 	Args      amqp.Table
 
-	Handler interface{}
+	// Basic handler. If AutoAck is false, function must call Ack() or Reject() method of delivery before exit.
+	Handler func(delivery amqp.Delivery)
+	// Easier way: data will be decoded with json.Unmarshal, ack or requeue will be performed based on return value.
+	// Should be func(decodedArg something) bool.
+	// @TODO Do we need a way to reject delivery without requeue? It migh be useful to send it to dead letter exchange.
+	DecodedHandler interface{}
+}
+
+func (s *Subscription) prepareHandler() {
+	if s.DecodedHandler == nil {
+		return
+	}
+	hType := reflect.TypeOf(s.DecodedHandler)
+	ok := true
+	if hType.Kind() != reflect.Func {
+		ok = false
+	}
+	if hType.NumOut() != 1 || hType.Out(0).Kind() != reflect.Bool {
+		ok = false
+	}
+	if hType.NumIn() != 1 {
+		ok = false
+	}
+	if !ok {
+		log.Fatalf("rabbit: DecodedHandler for subscription %v has unexpected type", s.Name)
+	}
+	argType := hType.In(0)
+	hValue := reflect.ValueOf(s.DecodedHandler)
+
+	s.Handler = func(m amqp.Delivery) {
+		if m.ContentType != encodedTrasferMimeType {
+			log.Debug("got delivery with unexpected mime type %+v", m.ContentType)
+			if !s.AutoAck {
+				// Remove it from queue any way
+				m.Ack(false)
+			}
+			return
+		}
+		var argPtr reflect.Value
+		if argType.Kind() != reflect.Ptr {
+			argPtr = reflect.New(argType)
+		} else {
+			argPtr = reflect.New(argType.Elem())
+		}
+		if err := json.Unmarshal(m.Body, argPtr.Interface()); err != nil {
+			log.Errorf("rabbit: failed to unmarshal argument of subscription '%v': %v\nData: %v", s.Name, err, string(m.Body))
+			if !s.AutoAck {
+				m.Ack(false)
+			}
+			return
+		}
+		if argType.Kind() != reflect.Ptr {
+			argPtr = reflect.Indirect(argPtr)
+		}
+		var args []reflect.Value
+		args = []reflect.Value{argPtr}
+		success := hValue.Call(args)[0].Bool()
+		if !s.AutoAck {
+			if success {
+				err := m.Ack(false)
+				if err != nil {
+					log.Errorf("rabbit: failed to acknowledge rabbit about successefuly handled msg: %v", err)
+				}
+			} else {
+				err := m.Reject(true)
+				if err != nil {
+					// It is not a big problem any way, without ack it will be requeued anyway.
+					log.Errorf("rabbit: failed to reject unsuccessefully handled message: %v", err)
+				}
+			}
+		}
+	}
 }
 
 func (s *Subscription) connLoop(c conn) {
@@ -327,7 +403,7 @@ func (s *Subscription) connLoop(c conn) {
 			return
 		} else if name, err := declareQueue(ch, &s.Queue); err != nil {
 			// We are trying to redeclare queue with incompatible settings probably, that should be logged.
-			log.Errorf("amqp: failed to declare queue for '%v': %v", s.Name, err)
+			log.Errorf("rabbit: failed to declare queue for '%v': %v", s.Name, err)
 		} else if deliveries, err := ch.Consume(
 			name,
 			"",
@@ -337,12 +413,11 @@ func (s *Subscription) connLoop(c conn) {
 			false,
 			s.Args,
 		); err != nil {
-			log.Errorf("amqp: failed to start consume on '%v': %v", s.Name, err)
+			log.Errorf("rabbit: failed to start consume on '%v': %v", s.Name, err)
 		} else {
 			log.Debug("starting consuming(%v)", name)
 			for delivery := range deliveries {
-				// @TODO handle
-				log.Debug("got delivery %+v", delivery)
+				s.Handler(delivery)
 			}
 		}
 		ch.Close()
@@ -356,11 +431,20 @@ func (s *Subscription) connLoop(c conn) {
 
 func Subscribe(subscriptions ...Subscription) {
 	for _, sub := range subscriptions {
-		if err := sub.Queue.Args.Validate(); err != nil {
-			log.Fatalf("rabbit: invalid arguments for queue '%v': %v", sub.Queue.Name, err)
+		if sub.Name == "" {
+			log.Fatalf("rabbit: empty subscription name")
 		}
 		if err := sub.Args.Validate(); err != nil {
-			log.Fatalf("rabbit: invalid arguments in subscripiton to queue '%v': %v", sub.Queue.Name, err)
+			log.Fatalf("rabbit: invalid arguments in subscripiton '%v': %v", sub.Name, err)
+		}
+		if err := sub.Queue.Args.Validate(); err != nil {
+			log.Fatalf("rabbit: invalid arguments for queue in subscription '%v': %v", sub.Name, err)
+		}
+		if sub.DecodedHandler != nil {
+			sub.prepareHandler()
+		}
+		if sub.Handler == nil {
+			log.Fatalf("rabbit: subscripiton '%v' do not have any handlers", sub.Queue.Name)
 		}
 		global.subscriptions[sub.Name] = &sub
 	}
