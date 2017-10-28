@@ -23,8 +23,8 @@ type Config struct {
 
 type Bindable interface {
 	GetName() string
-	Declare(ch *amqp.Channel) error
-	Bind(ch *amqp.Channel, exchange, key string) error
+	Declare(ch *amqp.Channel) (name string, err error)
+	Bind(ch *amqp.Channel, name, exchange, key string) error
 	Validate() error
 }
 
@@ -43,17 +43,22 @@ func (q Queue) GetName() string {
 	return q.Name
 }
 
-func (q Queue) Declare(ch *amqp.Channel) error {
-	if q.Name == "" {
-		log.Fatalf("Anonymous queues shuold not be declared via Bindable interface")
-	}
-	_, err := declareQueue(ch, &q)
-	return err
+func (q Queue) Declare(ch *amqp.Channel) (name string, err error) {
+	// If queue have empty name, broker will grant unique name to it.
+	ret, err := ch.QueueDeclare(
+		q.Name,
+		q.Durable,
+		q.AutoDelete,
+		q.Exclusive,
+		false,
+		q.Args,
+	)
+	return ret.Name, err
 }
 
-func (q Queue) Bind(ch *amqp.Channel, exchange, key string) error {
+func (q Queue) Bind(ch *amqp.Channel, name, exchange, key string) error {
 	return ch.QueueBind(
-		q.Name,
+		name,
 		key,
 		exchange,
 		false,
@@ -82,13 +87,22 @@ func (e Exchange) GetName() string {
 	return e.Name
 }
 
-func (e Exchange) Declare(ch *amqp.Channel) error {
-	return declareExchange(ch, &e)
+func (e Exchange) Declare(ch *amqp.Channel) (name string, err error) {
+	err = ch.ExchangeDeclare(
+		e.Name,
+		e.Kind,
+		e.Durable,
+		e.AutoDelete,
+		e.Internal,
+		false,
+		e.Args,
+	)
+	return e.Name, err
 }
 
-func (e Exchange) Bind(ch *amqp.Channel, exchange, key string) error {
+func (e Exchange) Bind(ch *amqp.Channel, name, exchange, key string) error {
 	return ch.ExchangeBind(
-		e.Name,
+		name,
 		key,
 		exchange,
 		false,
@@ -115,27 +129,37 @@ type Binding struct {
 
 type Route []Binding
 
-func (r Route) Declare(ch *amqp.Channel) error {
-	err := r.Validate()
+func (r Route) Declare(ch *amqp.Channel, declareAnonymousQueues bool) (lastName string, err error) {
+	err = r.Validate()
 	if err != nil {
-		return err
+		return "", err
 	}
-	lastName := ""
 	for i, bind := range r {
-		if err := bind.Node.Declare(ch); err != nil {
-			return fmt.Errorf("failed to declare node '%v': %v", r[0].Node.GetName(), err)
-		}
-		if i != 0 {
-			for _, key := range bind.Keys {
-				err := bind.Node.Bind(ch, lastName, key)
-				if err != nil {
-					return fmt.Errorf("failed to bind '%v' to '%v': %v", bind.Node.GetName(), lastName, err)
+		// Do not declare anonymous queue unless argument allows that.
+		if !declareAnonymousQueues && i+1 == len(r) {
+			if q, ok := bind.Node.(Queue); ok {
+				if q.Name == "" {
+					break
 				}
 			}
 		}
-		lastName = bind.Node.GetName()
+
+		curName, err := bind.Node.Declare(ch)
+		if err != nil {
+			return "", fmt.Errorf("failed to declare node '%v': %v", bind.Node.GetName(), err)
+		}
+		// There is nothing to to bind to yet.
+		if i != 0 {
+			for _, key := range bind.Keys {
+				err := bind.Node.Bind(ch, curName, lastName, key)
+				if err != nil {
+					return "", fmt.Errorf("failed to bind '%v' to '%v': %v", bind.Node.GetName(), lastName, err)
+				}
+			}
+		}
+		lastName = curName
 	}
-	return nil
+	return lastName, nil
 }
 
 func (r Route) Validate() error {
@@ -143,15 +167,15 @@ func (r Route) Validate() error {
 		return errors.New("zero-lengh route")
 	}
 	for i, bind := range r {
+		if bind.Node == nil {
+			return errors.New("nil node")
+		}
 		if i != 0 {
 			if len(bind.Keys) == 0 {
 				return errors.New("empty binding keyset")
 			}
 		}
-		if q, ok := bind.Node.(Queue); ok {
-			if q.Name == "" {
-				return errors.New("anonimous queue in route")
-			}
+		if _, ok := bind.Node.(Queue); ok {
 			if i+1 != len(r) {
 				return errors.New("queue can be only last part of route")
 			}
@@ -178,10 +202,11 @@ type pubWaiter struct {
 
 type Publisher struct {
 	// Local name for use in Publish() func.
-	Name string
-	// Ignore exchange below and use default one.
+	Name            string
 	DefaultExchange bool
-	Exchange        Exchange
+	// Unless DefaultExchange is true, messages will be published to first exchange of first route.
+	// Other router could be useful to declare complicated delivery schema.
+	Routes []Route
 	// Publishes can be undeliverable when the mandatory flag is true
 	// and no queue is bound that matches the routing key.
 	// Broker will return message to sender in this case.
@@ -193,31 +218,6 @@ type Publisher struct {
 	deliveryMode uint8
 	queryChan    chan pubQuery
 	lock         sync.RWMutex
-}
-
-func declareExchange(ch *amqp.Channel, e *Exchange) error {
-	return ch.ExchangeDeclare(
-		e.Name,
-		e.Kind,
-		e.Durable,
-		e.AutoDelete,
-		e.Internal,
-		false,
-		e.Args,
-	)
-}
-
-// If queue have empty name, broker will grant unique name to it. That is what returns.
-func declareQueue(ch *amqp.Channel, q *Queue) (name string, err error) {
-	ret, err := ch.QueueDeclare(
-		q.Name,
-		q.Durable,
-		q.AutoDelete,
-		q.Exclusive,
-		false,
-		q.Args,
-	)
-	return ret.Name, err
 }
 
 func (p *Publisher) connLoop(c conn) {
@@ -241,12 +241,10 @@ func (p *Publisher) connLoop(c conn) {
 }
 
 func (p *Publisher) prepareChanel(ch *amqp.Channel) bool {
-	if !p.DefaultExchange {
-		err := declareExchange(ch, &p.Exchange)
+	for i, route := range p.Routes {
+		_, err := route.Declare(ch, false)
 		if err != nil {
-			// Something is wrong with chanel or whole connection.
-			// Or we are trying to redeclare exchange with incompatible settings, that should be logged.
-			log.Errorf("rabbit: failed to declare exchange %v: %v", p.Exchange.Name, err)
+			log.Errorf("rabbit: failed to declare rounte #%v of publisher '%v': %v", i, p.Name, err)
 			return false
 		}
 	}
@@ -263,6 +261,10 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 	// https://pbs.twimg.com/media/DEvvvUoUIAEpAbU.jpg
 	waiters := NewTagRing(UnconfirmedPublishLimit)
 	haveTroubles := false
+	exchange := ""
+	if !p.DefaultExchange {
+		exchange = p.Routes[0][0].Node.GetName()
+	}
 	for {
 		var queries chan (pubQuery)
 		// publish extra messages only if we are not full of waiters
@@ -272,7 +274,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 		select {
 		case query := <-queries:
 			err := ch.Publish(
-				p.Exchange.Name,
+				exchange,
 				query.key,
 				p.Mandatory,
 				false, // rabbit do not support immediate exchanges anyway
@@ -410,14 +412,18 @@ func AddPublishers(pubs ...Publisher) {
 		if pub.Name == "" {
 			log.Fatalf("rabbit: empty publisher name")
 		}
-		if pub.DefaultExchange {
-			if pub.Exchange.Name != "" {
-				log.Fatalf("rabbit: non-empty exchange with DefaultExchange flag in publisher '%v'", pub.Name)
-			}
-		} else {
-			err := pub.Exchange.Validate()
+		for i, route := range pub.Routes {
+			err := route.Validate()
 			if err != nil {
-				log.Fatalf("rabbit: invalid exchange in publisher '%v': %v", pub.Name, err)
+				log.Fatalf("rabbit: invalid route #%v in publisher '%v': %v", i, pub.Name, err)
+			}
+		}
+		if !pub.DefaultExchange {
+			if len(pub.Routes) == 0 {
+				log.Fatalf("rabbit: zero routers and no DefaultExchange flag in publisher '%v'", pub.Name)
+			}
+			if _, ok := pub.Routes[0][0].Node.(Queue); ok {
+				log.Fatalf("raabit: publisher '%v': attempt to publish to queue", pub.Name)
 			}
 		}
 		pub.queryChan = make(chan pubQuery)
@@ -431,10 +437,11 @@ func AddPublishers(pubs ...Publisher) {
 }
 
 type Subscription struct {
-	// @TODO routes
 	// Local name for identify subscription
-	Name    string
-	Queue   Queue
+	Name string
+	// Subscription will consume from queue in first route.
+	// Multiple routes to same anonymous queue are not supported yet. @TODO Do we need it?
+	Routes  []Route
 	AutoAck bool
 	// When exclusive is true, the server will ensure that this is the sole consumer from this queue.
 	Exclusive bool
@@ -524,7 +531,7 @@ func (s *Subscription) connLoop(c conn) {
 		if err != nil {
 			c.amqp.Close()
 			return
-		} else if name, err := declareQueue(ch, &s.Queue); err != nil {
+		} else if name, ok := s.prepareChanel(ch); !ok {
 			// We are trying to redeclare queue with incompatible settings probably, that should be logged.
 			log.Errorf("rabbit: failed to declare queue for '%v': %v", s.Name, err)
 		} else if deliveries, err := ch.Consume(
@@ -538,7 +545,6 @@ func (s *Subscription) connLoop(c conn) {
 		); err != nil {
 			log.Errorf("rabbit: failed to start consume on '%v': %v", s.Name, err)
 		} else {
-			log.Debug("starting consuming(%v)", name)
 			for delivery := range deliveries {
 				s.Handler(delivery)
 			}
@@ -552,22 +558,47 @@ func (s *Subscription) connLoop(c conn) {
 	}
 }
 
+func (s *Subscription) prepareChanel(ch *amqp.Channel) (name string, ok bool) {
+	name, err := s.Routes[0].Declare(ch, true)
+	if err != nil {
+		log.Errorf("rabbit: failed to declare rounte #%v of subscription '%v': %v", 0, s.Name, err)
+		return "", false
+	}
+	for i, route := range s.Routes[1:] {
+		_, err := route.Declare(ch, false)
+		if err != nil {
+			log.Errorf("rabbit: failed to declare rounte #%v of subscription '%v': %v", i+1, s.Name, err)
+			return "", false
+		}
+	}
+	return name, true
+}
+
 func Subscribe(subscriptions ...Subscription) {
 	for _, sub := range subscriptions {
 		if sub.Name == "" {
 			log.Fatalf("rabbit: empty subscription name")
 		}
+		if len(sub.Routes) == 0 {
+			log.Fatalf("rabbit: no routes in subscription '%v'", sub.Name)
+		}
+		for i, route := range sub.Routes {
+			err := route.Validate()
+			if err != nil {
+				log.Fatalf("rabbit: invalid route #%v in subscription '%v': %v", i, sub.Name, err)
+			}
+		}
+		if _, ok := sub.Routes[0][len(sub.Routes[0])-1].Node.(Queue); !ok {
+			log.Fatalf("rabbit: first route in subscription '%v' do not end with queue", sub.Name)
+		}
 		if err := sub.Args.Validate(); err != nil {
 			log.Fatalf("rabbit: invalid arguments in subscripiton '%v': %v", sub.Name, err)
-		}
-		if err := sub.Queue.Args.Validate(); err != nil {
-			log.Fatalf("rabbit: invalid arguments for queue in subscription '%v': %v", sub.Name, err)
 		}
 		if sub.DecodedHandler != nil {
 			sub.prepareHandler()
 		}
 		if sub.Handler == nil {
-			log.Fatalf("rabbit: subscripiton '%v' do not have any handlers", sub.Queue.Name)
+			log.Fatalf("rabbit: subscripiton '%v' do not have any handlers", sub.Name)
 		}
 		global.subscriptions[sub.Name] = &sub
 	}
