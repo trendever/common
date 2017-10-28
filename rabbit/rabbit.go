@@ -21,6 +21,13 @@ type Config struct {
 	URL string
 }
 
+type Bindable interface {
+	GetName() string
+	Declare(ch *amqp.Channel) error
+	Bind(ch *amqp.Channel, exchange, key string) error
+	Validate() error
+}
+
 type Queue struct {
 	Name string
 	// Durable queues will survive between server restarts.
@@ -30,6 +37,32 @@ type Queue struct {
 	// Exclusive queues are only accessible by the connection that declares them and will be deleted when the connection closes.
 	Exclusive bool
 	Args      amqp.Table
+}
+
+func (q Queue) GetName() string {
+	return q.Name
+}
+
+func (q Queue) Declare(ch *amqp.Channel) error {
+	if q.Name == "" {
+		log.Fatalf("Anonymous queues shuold not be declared via Bindable interface")
+	}
+	_, err := declareQueue(ch, &q)
+	return err
+}
+
+func (q Queue) Bind(ch *amqp.Channel, exchange, key string) error {
+	return ch.QueueBind(
+		q.Name,
+		key,
+		exchange,
+		false,
+		nil, // @TODO Args?
+	)
+}
+
+func (q Queue) Validate() error {
+	return q.Args.Validate()
 }
 
 type Exchange struct {
@@ -43,6 +76,92 @@ type Exchange struct {
 	//  Exchanges declared as `internal` do not accept accept publishings. Internal exchanges are useful when you wish to implement inter-exchange topologies that should not be exposed to users of the broker.
 	Internal bool
 	Args     amqp.Table
+}
+
+func (e Exchange) GetName() string {
+	return e.Name
+}
+
+func (e Exchange) Declare(ch *amqp.Channel) error {
+	return declareExchange(ch, &e)
+}
+
+func (e Exchange) Bind(ch *amqp.Channel, exchange, key string) error {
+	return ch.ExchangeBind(
+		e.Name,
+		key,
+		exchange,
+		false,
+		nil, // @TODO Args?
+	)
+}
+
+func (e Exchange) Validate() error {
+	if e.Name == "" {
+		return errors.New("empty exchange name")
+	}
+	switch e.Kind {
+	case amqp.ExchangeDirect, amqp.ExchangeFanout, amqp.ExchangeTopic, amqp.ExchangeHeaders:
+	default:
+		return errors.New("unknown kind of exchange")
+	}
+	return e.Args.Validate()
+}
+
+type Binding struct {
+	Keys []string
+	Node Bindable
+}
+
+type Route []Binding
+
+func (r Route) Declare(ch *amqp.Channel) error {
+	err := r.Validate()
+	if err != nil {
+		return err
+	}
+	lastName := ""
+	for i, bind := range r {
+		if err := bind.Node.Declare(ch); err != nil {
+			return fmt.Errorf("failed to declare node '%v': %v", r[0].Node.GetName(), err)
+		}
+		if i != 0 {
+			for _, key := range bind.Keys {
+				err := bind.Node.Bind(ch, lastName, key)
+				if err != nil {
+					return fmt.Errorf("failed to bind '%v' to '%v': %v", bind.Node.GetName(), lastName, err)
+				}
+			}
+		}
+		lastName = bind.Node.GetName()
+	}
+	return nil
+}
+
+func (r Route) Validate() error {
+	if len(r) == 0 {
+		return errors.New("zero-lengh route")
+	}
+	for i, bind := range r {
+		if i != 0 {
+			if len(bind.Keys) == 0 {
+				return errors.New("empty binding keyset")
+			}
+		}
+		if q, ok := bind.Node.(Queue); ok {
+			if q.Name == "" {
+				return errors.New("anonimous queue in route")
+			}
+			if i+1 != len(r) {
+				return errors.New("queue can be only last part of route")
+			}
+		}
+		err := bind.Node.Validate()
+		if err != nil {
+			return fmt.Errorf("invalid bindable '%v': %v", bind.Node.GetName(), err)
+		}
+	}
+	return nil
 }
 
 type pubQuery struct {
@@ -73,7 +192,7 @@ type Publisher struct {
 
 	deliveryMode uint8
 	queryChan    chan pubQuery
-	lock sync.RWMutex
+	lock         sync.RWMutex
 }
 
 func declareExchange(ch *amqp.Channel, e *Exchange) error {
@@ -291,12 +410,15 @@ func AddPublishers(pubs ...Publisher) {
 		if pub.Name == "" {
 			log.Fatalf("rabbit: empty publisher name")
 		}
-		err := pub.Exchange.Args.Validate()
-		if err != nil {
-			log.Fatalf("rabbit: invalid arguments for exchange '%v': %v", pub.Exchange.Name, err)
-		}
-		if pub.DefaultExchange && pub.Exchange.Name != "" {
-			log.Fatalf("rabbit: non-empty exchange with DefaultExchange flag in publisher '%v'", pub.Name)
+		if pub.DefaultExchange {
+			if pub.Exchange.Name != "" {
+				log.Fatalf("rabbit: non-empty exchange with DefaultExchange flag in publisher '%v'", pub.Name)
+			}
+		} else {
+			err := pub.Exchange.Validate()
+			if err != nil {
+				log.Fatalf("rabbit: invalid exchange in publisher '%v': %v", pub.Name, err)
+			}
 		}
 		pub.queryChan = make(chan pubQuery)
 		if pub.Persistent {
@@ -317,6 +439,8 @@ type Subscription struct {
 	// When exclusive is true, the server will ensure that this is the sole consumer from this queue.
 	Exclusive bool
 	Args      amqp.Table
+
+	// @TODO Prefetch and parallel handling.
 
 	// Basic handler. If AutoAck is false, function must call Ack() or Reject() method of delivery before exit.
 	Handler func(delivery amqp.Delivery)
