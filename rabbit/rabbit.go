@@ -206,14 +206,17 @@ type Publisher struct {
 	DefaultExchange bool
 	// Unless DefaultExchange is true, messages will be published to first exchange of first route.
 	// Other router could be useful to declare complicated delivery schema.
-	Routes []Route
+	Routes     []Route
+	Persistent bool
+	// When true Publish() call will wait to confirmation from broker.
+	// For unroutable messages, the broker will issue a confirm once the exchange verifies
+	// a message won't route to any queue. See mandatory flag to deal with it.
+	Confirm bool
 	// Publishes can be undeliverable when the mandatory flag is true
 	// and no queue is bound that matches the routing key.
 	// Broker will return message to sender in this case.
 	// @TODO Add callback for returns.
-	Mandatory  bool
-	Persistent bool
-	// @TODO Make conformations optional.
+	Mandatory bool
 
 	deliveryMode uint8
 	queryChan    chan pubQuery
@@ -248,18 +251,24 @@ func (p *Publisher) prepareChanel(ch *amqp.Channel) bool {
 			return false
 		}
 	}
-	return ch.Confirm(false) == nil
+	return !p.Confirm || ch.Confirm(false) == nil
 }
 
 func (p *Publisher) chanLoop(ch *amqp.Channel) {
 	// @NOTICE I'm not sure about the way to handle troubles with chanel.
 	// We could save all unconfirmed queries and try to send them again later.
-	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, UnconfirmedPublishLimit))
+	var (
+		confirms chan amqp.Confirmation
+		waiters  TagRing
+	)
+	if p.Confirm {
+		confirms = ch.NotifyPublish(make(chan amqp.Confirmation, UnconfirmedPublishLimit))
+		// @TODO Specialize ring for pubWaiter type if it will not be used elsewhere
+		// https://pbs.twimg.com/media/DEvvvUoUIAEpAbU.jpg
+		waiters = NewTagRing(UnconfirmedPublishLimit)
+	}
 	returns := ch.NotifyReturn(make(chan amqp.Return))
 	closes := ch.NotifyClose(make(chan *amqp.Error))
-	// @TODO Specialize ring for pubWaiter type if it will not be used elsewhere
-	// https://pbs.twimg.com/media/DEvvvUoUIAEpAbU.jpg
-	waiters := NewTagRing(UnconfirmedPublishLimit)
 	haveTroubles := false
 	exchange := ""
 	if !p.DefaultExchange {
@@ -268,7 +277,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 	for {
 		var queries chan (pubQuery)
 		// publish extra messages only if we are not full of waiters
-		if !waiters.IsFull() && !haveTroubles {
+		if !p.Confirm || (!waiters.IsFull() && !haveTroubles) {
 			queries = p.queryChan
 		}
 		select {
@@ -291,10 +300,14 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 				query.replyChan <- err
 				continue
 			}
-			waiters.Enqueue(pubWaiter{
-				query:     query,
-				confirmed: false,
-			})
+			if p.Confirm {
+				waiters.Enqueue(pubWaiter{
+					query:     query,
+					confirmed: false,
+				})
+			} else {
+				query.replyChan <- nil
+			}
 		case confirm := <-confirms:
 			// Confirms chan will be closed before notify via closes chan.
 			// We could get here before case below...
