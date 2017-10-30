@@ -14,8 +14,11 @@ import (
 
 // Per topic limit for unconfirmed publishes.
 // Extra queries will not be sent to broker until acks for older messages will have been received.
-const UnconfirmedPublishLimit = 10
-const encodedTrasferMimeType = "application/json"
+const (
+	UnconfirmedPublishLimit    = 10
+	EncodedTransferContentType = "application/json"
+	RPCNamesPrefix             = "__rpc__"
+)
 
 type Config struct {
 	URL string
@@ -288,7 +291,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 				p.Mandatory,
 				false, // rabbit do not support immediate exchanges anyway
 				amqp.Publishing{
-					ContentType:  encodedTrasferMimeType,
+					ContentType:  EncodedTransferContentType,
 					Body:         query.data,
 					DeliveryMode: p.deliveryMode,
 				},
@@ -463,7 +466,7 @@ type Subscription struct {
 	// @TODO Prefetch and parallel handling.
 
 	// Basic handler. If AutoAck is false, function must call Ack() or Reject() method of delivery before exit.
-	Handler func(delivery amqp.Delivery)
+	Handler func(delivery amqp.Delivery, ch *amqp.Channel)
 	// Easier way: data will be decoded with json.Unmarshal, ack or requeue will be performed based on return value.
 	// Should be func(decodedArg something) bool.
 	// @TODO Do we need a way to reject delivery without requeue? It migh be useful to send it to dead letter exchange.
@@ -491,8 +494,8 @@ func (s *Subscription) prepareHandler() {
 	argType := hType.In(0)
 	hValue := reflect.ValueOf(s.DecodedHandler)
 
-	s.Handler = func(m amqp.Delivery) {
-		if m.ContentType != encodedTrasferMimeType {
+	s.Handler = func(m amqp.Delivery, _ *amqp.Channel) {
+		if m.ContentType != EncodedTransferContentType {
 			log.Debug("got delivery with unexpected mime type %+v", m.ContentType)
 			if !s.AutoAck {
 				// Remove it from queue any way
@@ -559,7 +562,7 @@ func (s *Subscription) connLoop(c conn) {
 			log.Errorf("rabbit: failed to start consume on '%v': %v", s.Name, err)
 		} else {
 			for delivery := range deliveries {
-				s.Handler(delivery)
+				s.Handler(delivery, ch)
 			}
 		}
 		ch.Close()
@@ -615,6 +618,181 @@ func Subscribe(subscriptions ...Subscription) {
 		}
 		global.subscriptions[sub.Name] = &sub
 	}
+}
+
+type RPC struct {
+	Name        string
+	Timeout     time.Duration
+	HandlerType interface{}
+}
+
+func (rpc RPC) Route() Route {
+	return Route{
+		{
+			Node: Exchange{
+				Name: RPCNamesPrefix + rpc.Name,
+				Kind: amqp.ExchangeFanout,
+				// There is totally no need to keep route when nobody uses it.
+				// Anything that was not delivered should disappear.
+				AutoDelete: true,
+				Durable:    false,
+			},
+		},
+		{
+			Keys: []string{""},
+			Node: Queue{
+				Name:       RPCNamesPrefix + rpc.Name,
+				AutoDelete: true,
+				Durable:    false,
+				Exclusive:  false,
+			},
+		},
+	}
+}
+
+func (rpc RPC) Validate() error {
+	if rpc.Name == "" {
+		return errors.New("empty name")
+	}
+	if rpc.HandlerType == nil {
+		return errors.New("nil HandlerType")
+	}
+	hType := reflect.TypeOf(rpc.HandlerType)
+	if hType.Kind() != reflect.Func {
+		return errors.New("HandlerType is not a function")
+	}
+	if hType.NumIn() != 1 || hType.NumOut() != 2 || hType.Out(1).Kind() != reflect.Bool {
+		return errors.New("HandlerType' has unexpected signatire")
+	}
+	return nil
+}
+
+func unmarshalToValue(data []byte, typ reflect.Type) (reflect.Value, error) {
+	var val reflect.Value
+	if typ.Kind() != reflect.Ptr {
+		val = reflect.New(typ)
+	} else {
+		val = reflect.New(typ.Elem())
+	}
+	if err := json.Unmarshal(data, val.Interface()); err != nil {
+		return reflect.Zero(typ), err
+	}
+	if typ.Kind() != reflect.Ptr {
+		val = reflect.Indirect(val)
+	}
+	return val, nil
+}
+
+func ServeRPC(desc RPC, handler interface{}) {
+	err := desc.Validate()
+	if err != nil {
+		log.Fatalf("rabbit: invalid description of RPC '%v': %v", desc.Name, err)
+	}
+	hType := reflect.TypeOf(desc.HandlerType)
+
+	if handler == nil {
+		log.Fatalf("rabbit: handler of RPC '%v' is nil")
+	}
+	if reflect.TypeOf(handler) != hType {
+		log.Fatalf("rabbit: handler of RPC '%v' have incompatible type")
+	}
+
+	argType := hType.In(0)
+	hValue := reflect.ValueOf(handler)
+
+	// Dat naming %)
+	realHandler := func(m amqp.Delivery, ch *amqp.Channel) {
+		if m.ContentType != EncodedTransferContentType {
+			log.Errorf("rabbit: rpc '%v' call argiment unexpected mime type %+v", desc.Name, m.ContentType)
+			return
+		}
+
+		arg, err := unmarshalToValue(m.Body, argType)
+		if err != nil {
+			log.Errorf("rabbit: failed to unmarshal call argument of rpc '%v': %v", desc.Name, err)
+		}
+		ret := hValue.Call([]reflect.Value{arg})
+		if !ret[1].Bool() {
+			// Hm... Now what?
+			// @TODO Send something back? Caller do not really need to wait whole timeout for nothing.
+			return
+		}
+		data, err := json.Marshal(ret[0].Interface())
+		if err != nil {
+			log.Errorf("rabbit: failed to marshal reply for rpc '%v': %v", desc.Name, err)
+			return
+		}
+		// Publish reply directly to caller queue.
+		ch.Publish("", m.ReplyTo, false, false, amqp.Publishing{
+			ContentType:   EncodedTransferContentType,
+			DeliveryMode:  amqp.Transient,
+			CorrelationId: m.CorrelationId,
+			Body:          data,
+		})
+	}
+
+	Subscribe(Subscription{
+		Name:      RPCNamesPrefix + desc.Name,
+		Routes:    []Route{desc.Route()},
+		AutoAck:   true,
+		Exclusive: false,
+		Handler:   realHandler,
+	})
+}
+
+func DeclareRPC(desc RPC, funcPtr interface{}) {
+	err := desc.Validate()
+	if err != nil {
+		log.Fatalf("rabbit: invalid description of RPC '%v': %v", desc.Name, err)
+	}
+
+	hType := reflect.TypeOf(desc.HandlerType)
+
+	if funcPtr == nil {
+		log.Fatalf("rabbit: funcPtr of RPC '%v' is nil")
+	}
+
+	funcPtrType := reflect.TypeOf(funcPtr)
+	funcType := funcPtrType.Elem()
+	if funcPtrType.Kind() != reflect.Ptr || funcType.Kind() != reflect.Func {
+		// x_x
+		log.Fatalf("rabbit: funcPtr of RPC '%v' is not pointer to function")
+	}
+
+	if funcType.NumIn() != 1 || funcType.NumOut() != 2 ||
+		funcType.In(0) != hType.In(0) || funcType.Out(0) != hType.Out(0) ||
+		funcType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		log.Fatalf("rabbit: funcPrt of RPC '%v' have incompatible type")
+	}
+
+	AddPublishers(Publisher{
+		Name:   RPCNamesPrefix + desc.Name,
+		Routes: []Route{desc.Route()},
+	})
+
+	retType := hType.In(0)
+
+	call := func(args []reflect.Value) (results []reflect.Value) {
+		// @TODO Ok, here we have shittons of troubles. We need:
+		// 1. name of our "anonymous" queue for replies in current chanel,
+		// 2. collation id,
+		// 3. way to set all this as fields of publish.
+		// 4. timeouts
+		err := Publish(
+			RPCNamesPrefix+desc.Name,
+			"",
+			args[0].Interface(),
+		)
+		if err != nil {
+			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(err)}
+		}
+		// @TODO
+
+		val, err := unmarshalToValue([]byte{}, retType)
+		return []reflect.Value{val, reflect.ValueOf(err)}
+	}
+
+	reflect.ValueOf(funcPtr).Elem().Set(reflect.MakeFunc(funcType, call))
 }
 
 type conn struct {
