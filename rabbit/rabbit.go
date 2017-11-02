@@ -4,8 +4,8 @@ import (
 	"common/log"
 	"common/stopper"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/pkg/errors"
 	"github.com/streadway/amqp"
 	"reflect"
 	"strconv"
@@ -214,7 +214,7 @@ type Publisher struct {
 	DefaultExchange bool
 	// Unless DefaultExchange is true, messages will be published to first exchange of first route.
 	// Other router could be useful to declare complicated delivery schema.
-	Routes     []Route
+	Routes []Route
 	// Persistent publishings will be restored in this queue on server restart.
 	Persistent bool
 	// When true Publish() call will wait to confirmation from broker.
@@ -477,7 +477,7 @@ type Subscription struct {
 	Concurrent bool
 	// With a prefetch count greater than zero, the server will deliver that many messages to consumers before acknowledgments are received.
 	// The server ignores this option when consumers are started with noAck because no acknowledgments are expected or sent.
-	Prefetch   int
+	Prefetch int
 
 	// Basic handler. If AutoAck is false, function must call Ack() or Reject() method of delivery before exit.
 	Handler func(delivery amqp.Delivery, ch *amqp.Channel)
