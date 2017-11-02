@@ -18,6 +18,7 @@ import (
 const (
 	UnconfirmedPublishLimit    = 10
 	EncodedTransferContentType = "application/json"
+	ErrorStringContentType     = "text/error"
 	RPCNamesPrefix             = "__rpc__"
 	DefaultRPCQueueLength      = 50
 )
@@ -707,7 +708,8 @@ func (rpc RPC) Validate() error {
 	if hType.Kind() != reflect.Func {
 		return errors.New("HandlerType is not a function")
 	}
-	if hType.NumIn() != 1 || hType.NumOut() != 2 || hType.Out(1).Kind() != reflect.Bool {
+	if hType.NumIn() != 1 || hType.NumOut() != 2 ||
+		!hType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
 		return errors.New("HandlerType' has unexpected signatire")
 	}
 	return nil
@@ -758,9 +760,15 @@ func ServeRPC(desc RPC, handler interface{}) {
 			log.Errorf("rabbit: failed to unmarshal call argument of rpc '%v': %v", desc.Name, err)
 		}
 		ret := hValue.Call([]reflect.Value{arg})
-		if !ret[1].Bool() {
-			// Hm... Now what?
-			// @TODO Send something back? Caller do not really need to wait whole timeout for nothing.
+		iface := ret[1].Interface()
+		if iface != nil {
+			err := iface.(error)
+			ch.Publish("", m.ReplyTo, false, false, amqp.Publishing{
+				ContentType:   ErrorStringContentType,
+				DeliveryMode:  amqp.Transient,
+				CorrelationId: m.CorrelationId,
+				Body:          []byte(err.Error()),
+			})
 			return
 		}
 		data, err := json.Marshal(ret[0].Interface())
@@ -810,9 +818,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 		log.Fatalf("rabbit: funcPtr of RPC '%v' is not pointer to function")
 	}
 
-	if funcType.NumIn() != 1 || funcType.NumOut() != 2 ||
-		funcType.In(0) != hType.In(0) || funcType.Out(0) != hType.Out(0) ||
-		!funcType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+	if funcType != hType {
 		log.Fatalf("rabbit: funcPrt of RPC '%v' have incompatible type", desc.Name)
 	}
 
@@ -877,13 +883,18 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 				log.Errorf("rabbit: invalid correlation id '%v' in reply for RPC '%v'", delivery.CorrelationId, desc.Name)
 			}
 
+			var reply rpcReply
+			if delivery.ContentType == ErrorStringContentType {
+				reply.err = errors.New(string(delivery.Body))
+			} else {
+				reply.data = delivery.Body
+			}
+
 			lock.Lock()
 			iface := waiters.Get(tag)
 			if iface != nil {
 				select {
-				case iface.(rpcWaiter).replyChan <- rpcReply{
-					data: delivery.Body,
-				}:
+				case iface.(rpcWaiter).replyChan <- reply:
 				default:
 				}
 			}
@@ -984,7 +995,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 			if reply.err != nil {
 				return []reflect.Value{
 					reflect.Zero(retType),
-					errValue(fmt.Errorf("fialed to consume reply: %v", reply.err)),
+					errValue(reply.err),
 				}
 			}
 			val, err := unmarshalToValue(reply.data, retType)
