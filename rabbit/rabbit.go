@@ -349,11 +349,13 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 					log.Warn("rabbit: got return %+v", ret)
 				}
 			}
-			// see notice above
-			for iface := waiters.Dequeue(); iface != nil; iface = waiters.Dequeue() {
-				waiter := iface.(pubWaiter)
-				if !waiter.confirmed {
-					waiter.query.replyChan <- err
+			if p.Confirm {
+				// see notice above
+				for iface := waiters.Dequeue(); iface != nil; iface = waiters.Dequeue() {
+					waiter := iface.(pubWaiter)
+					if !waiter.confirmed {
+						waiter.query.replyChan <- err
+					}
 				}
 			}
 			return
@@ -790,7 +792,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 
 	if funcType.NumIn() != 1 || funcType.NumOut() != 2 ||
 		funcType.In(0) != hType.In(0) || funcType.Out(0) != hType.Out(0) ||
-		funcType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		!funcType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
 		log.Fatalf("rabbit: funcPrt of RPC '%v' have incompatible type", desc.Name)
 	}
 
@@ -863,6 +865,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 	})
 
 	retType := hType.In(0)
+	nilErr := reflect.Zero(reflect.TypeOf((*error)(nil)).Elem())
 
 	// Dark reflect magic all round.
 	// https://pbs.twimg.com/media/DEvvvUoUIAEpAbU.jpg
@@ -872,7 +875,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 		if err != nil {
 			return []reflect.Value{
 				reflect.Zero(retType),
-				reflect.ValueOf(fmt.Errorf("fialed to marshal argument: %v", err)),
+				errValue(fmt.Errorf("fialed to marshal argument: %v", err)),
 			}
 		}
 
@@ -883,7 +886,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 		lock.Lock()
 		if waiters.IsFull() {
 			lock.Unlock()
-			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("waiters queue is full"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("waiters queue is full"))}
 		}
 		tag := waiters.Enqueue(rpcWaiter{
 			replyChan: replyChan,
@@ -922,14 +925,14 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 			key:           "",
 			data:          data,
 			replyTo:       qName,
-			correlationId: strconv.FormatUint(tag, 64),
+			correlationId: strconv.FormatUint(tag, 10),
 			replyChan:     pubChan,
 		}:
 
 		case <-timer.C:
-			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("timeout"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("timeout"))}
 		case <-global.conn.stopper.Chan():
-			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("connection stopped"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("connection stopped"))}
 		}
 
 		// Wait for publish.
@@ -938,14 +941,14 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 			if err != nil {
 				return []reflect.Value{
 					reflect.Zero(retType),
-					reflect.ValueOf(fmt.Errorf("fialed to publish argument: %v", err)),
+					errValue(fmt.Errorf("fialed to publish argument: %v", err)),
 				}
 			}
 
 		case <-timer.C:
-			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("timeout"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("timeout"))}
 		case <-global.conn.stopper.Chan():
-			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("connection stopped"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("connection stopped"))}
 		}
 
 		// Wait for reply.
@@ -954,26 +957,31 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 			if reply.err != nil {
 				return []reflect.Value{
 					reflect.Zero(retType),
-					reflect.ValueOf(fmt.Errorf("fialed to consume reply: %v", reply.err)),
+					errValue(fmt.Errorf("fialed to consume reply: %v", reply.err)),
 				}
 			}
-			val, err := unmarshalToValue([]byte{}, retType)
+			val, err := unmarshalToValue(reply.data, retType)
 			if err != nil {
 				return []reflect.Value{
 					reflect.Zero(retType),
-					reflect.ValueOf(fmt.Errorf("fialed to unmarshal reply: %v", err)),
+					errValue(fmt.Errorf("fialed to unmarshal reply: %v", err)),
 				}
 			}
-			return []reflect.Value{val, reflect.ValueOf(err)}
+			return []reflect.Value{val, nilErr}
 
 		case <-timer.C:
-			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("timeout"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("timeout"))}
 		case <-global.conn.stopper.Chan():
-			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("connection stopped"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("connection stopped"))}
 		}
 	}
 
 	reflect.ValueOf(funcPtr).Elem().Set(reflect.MakeFunc(funcType, call))
+}
+
+
+func errValue(err error) reflect.Value {
+	return reflect.ValueOf(&err).Elem()
 }
 
 type conn struct {
