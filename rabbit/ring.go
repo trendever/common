@@ -8,8 +8,8 @@ type TagRing struct {
 	len    uint64
 }
 
-func NewTagRing(cap int) TagRing {
-	return TagRing{
+func NewTagRing(cap int) *TagRing {
+	return &TagRing{
 		data: make([]interface{}, cap, cap),
 		// for reasons %)
 		tail: 1,

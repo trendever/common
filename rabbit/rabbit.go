@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/streadway/amqp"
 	"reflect"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -18,6 +19,7 @@ const (
 	UnconfirmedPublishLimit    = 10
 	EncodedTransferContentType = "application/json"
 	RPCNamesPrefix             = "__rpc__"
+	DefaultRPCQueueLength      = 20
 )
 
 type Config struct {
@@ -192,10 +194,12 @@ func (r Route) Validate() error {
 }
 
 type pubQuery struct {
-	key       string
-	data      []byte
-	confirmed bool
-	replyChan chan error
+	key           string
+	data          []byte
+	replyTo       string
+	correlationId string
+	confirmed     bool
+	replyChan     chan error
 }
 
 type pubWaiter struct {
@@ -262,12 +266,10 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 	// We could save all unconfirmed queries and try to send them again later.
 	var (
 		confirms chan amqp.Confirmation
-		waiters  TagRing
+		waiters  *TagRing
 	)
 	if p.Confirm {
 		confirms = ch.NotifyPublish(make(chan amqp.Confirmation, UnconfirmedPublishLimit))
-		// @TODO Specialize ring for pubWaiter type if it will not be used elsewhere
-		// https://pbs.twimg.com/media/DEvvvUoUIAEpAbU.jpg
 		waiters = NewTagRing(UnconfirmedPublishLimit)
 	}
 	returns := ch.NotifyReturn(make(chan amqp.Return))
@@ -291,9 +293,11 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 				p.Mandatory,
 				false, // rabbit do not support immediate exchanges anyway
 				amqp.Publishing{
-					ContentType:  EncodedTransferContentType,
-					Body:         query.data,
-					DeliveryMode: p.deliveryMode,
+					ContentType:   EncodedTransferContentType,
+					Body:          query.data,
+					ReplyTo:       query.replyTo,
+					CorrelationId: query.correlationId,
+					DeliveryMode:  p.deliveryMode,
 				},
 			)
 			// We have troubles with chanel or connection.
@@ -318,7 +322,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 				confirms = nil
 				continue
 			}
-			p.handleConfirm(&waiters, confirm)
+			p.handleConfirm(waiters, confirm)
 		// Message is returned if no route(connected queues) found for mandatory exchanges.
 		case ret := <-returns:
 			// @TODO add callback? idk whether we need it anyway.
@@ -334,7 +338,7 @@ func (p *Publisher) chanLoop(ch *amqp.Channel) {
 					if confirm.DeliveryTag == 0 {
 						break
 					}
-					p.handleConfirm(&waiters, confirm)
+					p.handleConfirm(waiters, confirm)
 				}
 			}
 			if returns != nil {
@@ -395,13 +399,18 @@ func (p *Publisher) handleConfirm(waiters *TagRing, confirm amqp.Confirmation) {
 }
 
 func Publish(topic, routeKey string, data interface{}) error {
-	pub, ok := global.publishers[topic]
-	if !ok {
-		return errors.New("unknown publish topic")
-	}
 	bytes, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal data: %v", err)
+	}
+
+	return publish(topic, routeKey, "", "", bytes)
+}
+
+func publish(topic, routeKey, replyTo, correlationId string, data []byte) error {
+	pub, ok := global.publishers[topic]
+	if !ok {
+		return errors.New("unknown publish topic")
 	}
 
 	pub.lock.RLock()
@@ -414,9 +423,11 @@ func Publish(topic, routeKey string, data interface{}) error {
 	}
 	replyChan := make(chan error)
 	pub.queryChan <- pubQuery{
-		key:       routeKey,
-		data:      bytes,
-		replyChan: replyChan,
+		key:           routeKey,
+		data:          data,
+		replyTo:       replyTo,
+		correlationId: correlationId,
+		replyChan:     replyChan,
 	}
 	pub.lock.RUnlock()
 	return <-replyChan
@@ -471,6 +482,11 @@ type Subscription struct {
 	// Should be func(decodedArg something) bool.
 	// @TODO Do we need a way to reject delivery without requeue? It migh be useful to send it to dead letter exchange.
 	DecodedHandler interface{}
+
+	// If set, this will be called after declaration routes.
+	// Second argument — name of queue from with subscription will consume.
+	// Useful for obtaining names of "anonymous" queues.
+	ReconnectCallback func(ch *amqp.Channel, endpoint string) error
 }
 
 func (s *Subscription) prepareHandler() {
@@ -587,6 +603,14 @@ func (s *Subscription) prepareChanel(ch *amqp.Channel) (name string, ok bool) {
 			return "", false
 		}
 	}
+	if s.ReconnectCallback != nil {
+		err := s.ReconnectCallback(ch, name)
+		if err != nil {
+			log.Errorf("rabbit: ReconnectCallback of subscription '%v' returned error: %v", s.Name, err)
+			return "", false
+		}
+	}
+
 	return name, true
 }
 
@@ -623,6 +647,7 @@ func Subscribe(subscriptions ...Subscription) {
 type RPC struct {
 	Name        string
 	Timeout     time.Duration
+	QueueLength int
 	HandlerType interface{}
 }
 
@@ -746,6 +771,10 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 		log.Fatalf("rabbit: invalid description of RPC '%v': %v", desc.Name, err)
 	}
 
+	if desc.QueueLength == 0 {
+		desc.QueueLength = DefaultRPCQueueLength
+	}
+
 	hType := reflect.TypeOf(desc.HandlerType)
 
 	if funcPtr == nil {
@@ -762,7 +791,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 	if funcType.NumIn() != 1 || funcType.NumOut() != 2 ||
 		funcType.In(0) != hType.In(0) || funcType.Out(0) != hType.Out(0) ||
 		funcType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
-		log.Fatalf("rabbit: funcPrt of RPC '%v' have incompatible type")
+		log.Fatalf("rabbit: funcPrt of RPC '%v' have incompatible type", desc.Name)
 	}
 
 	AddPublishers(Publisher{
@@ -770,26 +799,178 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 		Routes: []Route{desc.Route()},
 	})
 
+	var (
+		lock      sync.Mutex
+		queueName string
+		waiters   *TagRing = NewTagRing(desc.QueueLength)
+		pub                = global.publishers[RPCNamesPrefix+desc.Name]
+	)
+
+	type rpcReply struct {
+		data []byte
+		err  error
+	}
+	type rpcWaiter struct {
+		replyChan chan rpcReply
+		done      bool
+	}
+
+	Subscribe(Subscription{
+		Name:    RPCNamesPrefix + desc.Name + "_reply",
+		AutoAck: true,
+		Routes: []Route{
+			{{
+				Node: Queue{
+					Name:       "",
+					AutoDelete: true,
+					Durable:    false,
+					Exclusive:  true,
+				},
+			}},
+		},
+
+		ReconnectCallback: func(ch *amqp.Channel, endpoint string) error {
+			lock.Lock()
+			queueName = endpoint
+			base := waiters.FirstTag()
+			for i := uint64(0); i < waiters.Len(); i++ {
+				waiter := waiters.Get(base + i).(rpcWaiter)
+				if !waiter.done {
+					waiter.replyChan <- rpcReply{
+						err: errors.New("connection aborted"),
+					}
+				}
+			}
+			lock.Unlock()
+			return nil
+		},
+
+		Handler: func(delivery amqp.Delivery, ch *amqp.Channel) {
+			tag, err := strconv.ParseUint(delivery.CorrelationId, 10, 64)
+			if err != nil {
+				log.Errorf("rabbit: invalid correlation id '%v' in reply for RPC '%v'", delivery.CorrelationId, desc.Name)
+			}
+
+			lock.Lock()
+			iface := waiters.Get(tag)
+			if iface != nil {
+				iface.(rpcWaiter).replyChan <- rpcReply{
+					data: delivery.Body,
+				}
+			}
+			lock.Unlock()
+		},
+	})
+
 	retType := hType.In(0)
 
+	// Dark reflect magic all round.
+	// https://pbs.twimg.com/media/DEvvvUoUIAEpAbU.jpg
 	call := func(args []reflect.Value) (results []reflect.Value) {
-		// @TODO Ok, here we have shittons of troubles. We need:
-		// 1. name of our "anonymous" queue for replies in current chanel,
-		// 2. collation id,
-		// 3. way to set all this as fields of publish.
-		// 4. timeouts
-		err := Publish(
-			RPCNamesPrefix+desc.Name,
-			"",
-			args[0].Interface(),
-		)
+		// Marshal argument first, no need to resume when it's invalid.
+		data, err := json.Marshal(args[0].Interface())
 		if err != nil {
-			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(err)}
+			return []reflect.Value{
+				reflect.Zero(retType),
+				reflect.ValueOf(fmt.Errorf("fialed to marshal argument: %v", err)),
+			}
 		}
-		// @TODO
 
-		val, err := unmarshalToValue([]byte{}, retType)
-		return []reflect.Value{val, reflect.ValueOf(err)}
+		timer := time.NewTimer(desc.Timeout)
+		replyChan := make(chan rpcReply, 1)
+
+		// Add waiter.
+		lock.Lock()
+		if waiters.IsFull() {
+			lock.Unlock()
+			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("waiters queue is full"))}
+		}
+		tag := waiters.Enqueue(rpcWaiter{
+			replyChan: replyChan,
+		})
+		qName := queueName
+		lock.Unlock()
+
+		// Remove waiter on exit.
+		defer func() {
+			lock.Lock()
+			if waiters.FirstTag() == tag {
+				waiters.Dequeue()
+				for {
+					iface := waiters.Pick()
+					if iface == nil {
+						break
+					}
+					waiter := iface.(rpcWaiter)
+					if !waiter.done {
+						break
+					}
+					waiters.Dequeue()
+				}
+			} else {
+				waiters.Update(tag, rpcWaiter{
+					done: true,
+				})
+			}
+			lock.Unlock()
+		}()
+
+		pubChan := make(chan error)
+		// Send publish query.
+		select {
+		case pub.queryChan <- pubQuery{
+			key:           "",
+			data:          data,
+			replyTo:       qName,
+			correlationId: strconv.FormatUint(tag, 64),
+			replyChan:     pubChan,
+		}:
+
+		case <-timer.C:
+			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("timeout"))}
+		case <-global.conn.stopper.Chan():
+			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("connection stopped"))}
+		}
+
+		// Wait for publish.
+		select {
+		case err := <-pubChan:
+			if err != nil {
+				return []reflect.Value{
+					reflect.Zero(retType),
+					reflect.ValueOf(fmt.Errorf("fialed to publish argument: %v", err)),
+				}
+			}
+
+		case <-timer.C:
+			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("timeout"))}
+		case <-global.conn.stopper.Chan():
+			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("connection stopped"))}
+		}
+
+		// Wait for reply.
+		select {
+		case reply := <-replyChan:
+			if reply.err != nil {
+				return []reflect.Value{
+					reflect.Zero(retType),
+					reflect.ValueOf(fmt.Errorf("fialed to consume reply: %v", reply.err)),
+				}
+			}
+			val, err := unmarshalToValue([]byte{}, retType)
+			if err != nil {
+				return []reflect.Value{
+					reflect.Zero(retType),
+					reflect.ValueOf(fmt.Errorf("fialed to unmarshal reply: %v", err)),
+				}
+			}
+			return []reflect.Value{val, reflect.ValueOf(err)}
+
+		case <-timer.C:
+			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("timeout"))}
+		case <-global.conn.stopper.Chan():
+			return []reflect.Value{reflect.Zero(retType), reflect.ValueOf(errors.New("connection stopped"))}
+		}
 	}
 
 	reflect.ValueOf(funcPtr).Elem().Set(reflect.MakeFunc(funcType, call))
