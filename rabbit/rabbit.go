@@ -19,7 +19,7 @@ const (
 	UnconfirmedPublishLimit    = 10
 	EncodedTransferContentType = "application/json"
 	RPCNamesPrefix             = "__rpc__"
-	DefaultRPCQueueLength      = 20
+	DefaultRPCQueueLength      = 50
 )
 
 type Config struct {
@@ -475,8 +475,9 @@ type Subscription struct {
 	// When exclusive is true, the server will ensure that this is the sole consumer from this queue.
 	Exclusive bool
 	Args      amqp.Table
-
-	// @TODO Prefetch and parallel handling.
+	// Run handlers in gorutines.
+	Concurrent bool
+	Prefetch   int
 
 	// Basic handler. If AutoAck is false, function must call Ack() or Reject() method of delivery before exit.
 	Handler func(delivery amqp.Delivery, ch *amqp.Channel)
@@ -580,7 +581,15 @@ func (s *Subscription) connLoop(c conn) {
 			log.Errorf("rabbit: failed to start consume on '%v': %v", s.Name, err)
 		} else {
 			for delivery := range deliveries {
-				s.Handler(delivery, ch)
+				if s.Concurrent {
+					go func() {
+						c.wait.Add(1)
+						s.Handler(delivery, ch)
+						c.wait.Done()
+					}()
+				} else {
+					s.Handler(delivery, ch)
+				}
 			}
 		}
 		ch.Close()
@@ -605,6 +614,15 @@ func (s *Subscription) prepareChanel(ch *amqp.Channel) (name string, ok bool) {
 			return "", false
 		}
 	}
+
+	if s.Prefetch > 0 {
+		err := ch.Qos(s.Prefetch, 0, false)
+		if err != nil {
+			log.Errorf("rabbit: failed to set prefetch count on subscription '%v': %v", s.Name, err)
+			return "", false
+		}
+	}
+
 	if s.ReconnectCallback != nil {
 		err := s.ReconnectCallback(ch, name)
 		if err != nil {
@@ -650,6 +668,7 @@ type RPC struct {
 	Name        string
 	Timeout     time.Duration
 	QueueLength int
+	Concurrent  bool
 	HandlerType interface{}
 }
 
@@ -759,11 +778,12 @@ func ServeRPC(desc RPC, handler interface{}) {
 	}
 
 	Subscribe(Subscription{
-		Name:      RPCNamesPrefix + desc.Name,
-		Routes:    []Route{desc.Route()},
-		AutoAck:   true,
-		Exclusive: false,
-		Handler:   realHandler,
+		Name:       RPCNamesPrefix + desc.Name,
+		Routes:     []Route{desc.Route()},
+		AutoAck:    true,
+		Exclusive:  false,
+		Handler:    realHandler,
+		Concurrent: desc.Concurrent,
 	})
 }
 
@@ -818,8 +838,9 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 	}
 
 	Subscribe(Subscription{
-		Name:    RPCNamesPrefix + desc.Name + "_reply",
-		AutoAck: true,
+		Name:       RPCNamesPrefix + desc.Name + "_reply",
+		AutoAck:    true,
+		Concurrent: false, // Most of time will be spent behind waiters lock anyway.
 		Routes: []Route{
 			{{
 				Node: Queue{
@@ -838,8 +859,11 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 			for i := uint64(0); i < waiters.Len(); i++ {
 				waiter := waiters.Get(base + i).(rpcWaiter)
 				if !waiter.done {
-					waiter.replyChan <- rpcReply{
+					select {
+					case waiter.replyChan <- rpcReply{
 						err: errors.New("connection aborted"),
+					}:
+					default:
 					}
 				}
 			}
@@ -856,8 +880,11 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 			lock.Lock()
 			iface := waiters.Get(tag)
 			if iface != nil {
-				iface.(rpcWaiter).replyChan <- rpcReply{
+				select {
+				case iface.(rpcWaiter).replyChan <- rpcReply{
 					data: delivery.Body,
+				}:
+				default:
 				}
 			}
 			lock.Unlock()
@@ -978,7 +1005,6 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 
 	reflect.ValueOf(funcPtr).Elem().Set(reflect.MakeFunc(funcType, call))
 }
-
 
 func errValue(err error) reflect.Value {
 	return reflect.ValueOf(&err).Elem()
