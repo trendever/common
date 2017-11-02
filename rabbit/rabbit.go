@@ -215,6 +215,7 @@ type Publisher struct {
 	// Unless DefaultExchange is true, messages will be published to first exchange of first route.
 	// Other router could be useful to declare complicated delivery schema.
 	Routes     []Route
+	// Persistent publishings will be restored in this queue on server restart.
 	Persistent bool
 	// When true Publish() call will wait to confirmation from broker.
 	// For unroutable messages, the broker will issue a confirm once the exchange verifies
@@ -402,18 +403,14 @@ func (p *Publisher) handleConfirm(waiters *TagRing, confirm amqp.Confirmation) {
 }
 
 func Publish(topic, routeKey string, data interface{}) error {
-	bytes, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal data: %v", err)
-	}
-
-	return publish(topic, routeKey, "", "", bytes)
-}
-
-func publish(topic, routeKey, replyTo, correlationId string, data []byte) error {
 	pub, ok := global.publishers[topic]
 	if !ok {
 		return errors.New("unknown publish topic")
+	}
+
+	bytes, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal data: %v", err)
 	}
 
 	pub.lock.RLock()
@@ -427,9 +424,9 @@ func publish(topic, routeKey, replyTo, correlationId string, data []byte) error 
 	replyChan := make(chan error)
 	pub.queryChan <- pubQuery{
 		key:           routeKey,
-		data:          data,
-		replyTo:       replyTo,
-		correlationId: correlationId,
+		data:          bytes,
+		replyTo:       "",
+		correlationId: "",
 		replyChan:     replyChan,
 	}
 	pub.lock.RUnlock()
@@ -478,6 +475,8 @@ type Subscription struct {
 	Args      amqp.Table
 	// Run handlers in gorutines.
 	Concurrent bool
+	// With a prefetch count greater than zero, the server will deliver that many messages to consumers before acknowledgments are received.
+	// The server ignores this option when consumers are started with noAck because no acknowledgments are expected or sent.
 	Prefetch   int
 
 	// Basic handler. If AutoAck is false, function must call Ack() or Reject() method of delivery before exit.
@@ -498,17 +497,8 @@ func (s *Subscription) prepareHandler() {
 		return
 	}
 	hType := reflect.TypeOf(s.DecodedHandler)
-	ok := true
-	if hType.Kind() != reflect.Func {
-		ok = false
-	}
-	if hType.NumOut() != 1 || hType.Out(0).Kind() != reflect.Bool {
-		ok = false
-	}
-	if hType.NumIn() != 1 {
-		ok = false
-	}
-	if !ok {
+	if hType.Kind() != reflect.Func || hType.NumIn() != 1 ||
+		hType.NumOut() != 1 || hType.Out(0).Kind() != reflect.Bool {
 		log.Fatalf("rabbit: DecodedHandler for subscription %v has unexpected type", s.Name)
 	}
 	argType := hType.In(0)
@@ -516,31 +506,22 @@ func (s *Subscription) prepareHandler() {
 
 	s.Handler = func(m amqp.Delivery, _ *amqp.Channel) {
 		if m.ContentType != EncodedTransferContentType {
-			log.Debug("got delivery with unexpected mime type %+v", m.ContentType)
+			log.Errorf("rabbit: got delivery with unexpected mime type %+v", m.ContentType)
 			if !s.AutoAck {
 				// Remove it from queue any way
 				m.Ack(false)
 			}
 			return
 		}
-		var argPtr reflect.Value
-		if argType.Kind() != reflect.Ptr {
-			argPtr = reflect.New(argType)
-		} else {
-			argPtr = reflect.New(argType.Elem())
-		}
-		if err := json.Unmarshal(m.Body, argPtr.Interface()); err != nil {
+		arg, err := unmarshalToValue(m.Body, argType)
+		if err != nil {
 			log.Errorf("rabbit: failed to unmarshal argument of subscription '%v': %v\nData: %v", s.Name, err, string(m.Body))
 			if !s.AutoAck {
 				m.Ack(false)
 			}
 			return
 		}
-		if argType.Kind() != reflect.Ptr {
-			argPtr = reflect.Indirect(argPtr)
-		}
-		var args []reflect.Value
-		args = []reflect.Value{argPtr}
+		args := []reflect.Value{arg}
 		success := hValue.Call(args)[0].Bool()
 		if !s.AutoAck {
 			if success {
@@ -583,8 +564,8 @@ func (s *Subscription) connLoop(c conn) {
 		} else {
 			for delivery := range deliveries {
 				if s.Concurrent {
+					c.wait.Add(1)
 					go func() {
-						c.wait.Add(1)
 						s.Handler(delivery, ch)
 						c.wait.Done()
 					}()
