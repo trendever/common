@@ -21,6 +21,7 @@ const (
 	ErrorStringContentType     = "text/error"
 	RPCNamesPrefix             = "__rpc__"
 	DefaultRPCQueueLength      = 50
+	DefaultRPCTimeout          = 2 * time.Second
 )
 
 type Config struct {
@@ -473,7 +474,7 @@ type Subscription struct {
 	// When exclusive is true, the server will ensure that this is the sole consumer from this queue.
 	Exclusive bool
 	Args      amqp.Table
-	// Run handlers in gorutines.
+	// Run handlers in gorutines. @TODO It does not work yet, do not use...
 	Concurrent bool
 	// With a prefetch count greater than zero, the server will deliver that many messages to consumers before acknowledgments are received.
 	// The server ignores this option when consumers are started with noAck because no acknowledgments are expected or sent.
@@ -613,6 +614,13 @@ func (s *Subscription) prepareChanel(ch *amqp.Channel) (name string, ok bool) {
 		}
 	}
 
+	closes := ch.NotifyClose(make(chan *amqp.Error))
+	go func() {
+		for err := range closes {
+			log.Errorf("%+v", err)
+		}
+	}()
+
 	return name, true
 }
 
@@ -650,6 +658,7 @@ type RPC struct {
 	Name        string
 	Timeout     time.Duration
 	QueueLength int
+	// @TODO It does not work yet, do not use...
 	Concurrent  bool
 	HandlerType interface{}
 }
@@ -785,6 +794,9 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 	if desc.QueueLength == 0 {
 		desc.QueueLength = DefaultRPCQueueLength
 	}
+	if desc.Timeout == 0 {
+		desc.Timeout = DefaultRPCTimeout
+	}
 
 	hType := reflect.TypeOf(desc.HandlerType)
 
@@ -862,6 +874,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 			tag, err := strconv.ParseUint(delivery.CorrelationId, 10, 64)
 			if err != nil {
 				log.Errorf("rabbit: invalid correlation id '%v' in reply for RPC '%v'", delivery.CorrelationId, desc.Name)
+				return
 			}
 
 			var reply rpcReply
