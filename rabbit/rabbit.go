@@ -896,7 +896,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 		},
 	})
 
-	retType := hType.In(0)
+	retType := hType.Out(0)
 	nilErr := reflect.Zero(reflect.TypeOf((*error)(nil)).Elem())
 
 	// Dark reflect magic all round.
