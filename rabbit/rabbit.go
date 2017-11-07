@@ -785,6 +785,27 @@ func ServeRPC(desc RPC, handler interface{}) {
 	})
 }
 
+type RPCErrorType int
+
+const (
+	RPCError_InvalidArgument = iota
+	RPCError_Timeout
+	RPCError_QueueOverflow
+	RPCError_Network
+	RPCError_InvalidReply
+	// Error from other side
+	RPCError_Forwarded
+)
+
+type RPCError struct {
+	Kind        RPCErrorType
+	Description string
+}
+
+func (e RPCError) Error() string {
+	return e.Description
+}
+
 func DeclareRPC(desc RPC, funcPtr interface{}) {
 	err := desc.Validate()
 	if err != nil {
@@ -860,7 +881,10 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 				if !waiter.done {
 					select {
 					case waiter.replyChan <- rpcReply{
-						err: errors.New("connection aborted"),
+						err: RPCError{
+							Kind:        RPCError_Network,
+							Description: "connection aborted",
+						},
 					}:
 					default:
 					}
@@ -879,7 +903,10 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 
 			var reply rpcReply
 			if delivery.ContentType == ErrorStringContentType {
-				reply.err = errors.New(string(delivery.Body))
+				reply.err = RPCError{
+					Kind:        RPCError_Forwarded,
+					Description: string(delivery.Body),
+				}
 			} else {
 				reply.data = delivery.Body
 			}
@@ -907,7 +934,10 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 		if err != nil {
 			return []reflect.Value{
 				reflect.Zero(retType),
-				errValue(fmt.Errorf("fialed to marshal argument: %v", err)),
+				errValue(RPCError{
+					Kind:        RPCError_InvalidArgument,
+					Description: fmt.Sprintf("fialed to marshal argument: %v", err),
+				}),
 			}
 		}
 
@@ -918,7 +948,10 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 		lock.Lock()
 		if waiters.IsFull() {
 			lock.Unlock()
-			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("waiters queue is full"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(RPCError{
+				Kind:        RPCError_QueueOverflow,
+				Description: "waiters queue is full",
+			})}
 		}
 		tag := waiters.Enqueue(rpcWaiter{
 			replyChan: replyChan,
@@ -962,9 +995,15 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 		}:
 
 		case <-timer.C:
-			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("timeout"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(RPCError{
+				Kind:        RPCError_Timeout,
+				Description: "timeout",
+			})}
 		case <-global.conn.stopper.Chan():
-			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("connection stopped"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(RPCError{
+				Kind:        RPCError_Network,
+				Description: "connection is stopped",
+			})}
 		}
 
 		// Wait for publish.
@@ -973,14 +1012,23 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 			if err != nil {
 				return []reflect.Value{
 					reflect.Zero(retType),
-					errValue(fmt.Errorf("fialed to publish argument: %v", err)),
+					errValue(RPCError{
+						Kind:        RPCError_Network,
+						Description: fmt.Sprintf("fialed to publish argument: %v", err),
+					}),
 				}
 			}
 
 		case <-timer.C:
-			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("timeout"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(RPCError{
+				Kind:        RPCError_Timeout,
+				Description: "timeout",
+			})}
 		case <-global.conn.stopper.Chan():
-			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("connection stopped"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(RPCError{
+				Kind:        RPCError_Network,
+				Description: "connection is stopped",
+			})}
 		}
 
 		// Wait for reply.
@@ -996,15 +1044,24 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 			if err != nil {
 				return []reflect.Value{
 					reflect.Zero(retType),
-					errValue(fmt.Errorf("fialed to unmarshal reply: %v", err)),
+					errValue(RPCError{
+						Kind:        RPCError_InvalidReply,
+						Description: fmt.Sprintf("fialed to unmarshal reply: %v", err),
+					}),
 				}
 			}
 			return []reflect.Value{val, nilErr}
 
 		case <-timer.C:
-			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("timeout"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(RPCError{
+				Kind:        RPCError_Timeout,
+				Description: "timeout",
+			})}
 		case <-global.conn.stopper.Chan():
-			return []reflect.Value{reflect.Zero(retType), errValue(errors.New("connection stopped"))}
+			return []reflect.Value{reflect.Zero(retType), errValue(RPCError{
+				Kind:        RPCError_Network,
+				Description: "connection is stopped",
+			})}
 		}
 	}
 
