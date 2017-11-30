@@ -729,10 +729,10 @@ func ServeRPC(desc RPC, handler interface{}) {
 	hType := reflect.TypeOf(desc.HandlerType)
 
 	if handler == nil {
-		log.Fatalf("rabbit: handler of RPC '%v' is nil")
+		log.Fatalf("rabbit: handler of RPC '%v' is nil", desc.Name)
 	}
 	if reflect.TypeOf(handler) != hType {
-		log.Fatalf("rabbit: handler of RPC '%v' have incompatible type")
+		log.Fatalf("rabbit: handler of RPC '%v' have incompatible type", desc.Name)
 	}
 
 	argType := hType.In(0)
@@ -826,10 +826,12 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 	}
 
 	funcPtrType := reflect.TypeOf(funcPtr)
+	if funcPtrType.Kind() != reflect.Ptr {
+		log.Fatalf("rabbit: funcPtr of RPC '%v' is not pointer", desc.Name)
+	}
 	funcType := funcPtrType.Elem()
-	if funcPtrType.Kind() != reflect.Ptr || funcType.Kind() != reflect.Func {
-		// x_x
-		log.Fatalf("rabbit: funcPtr of RPC '%v' is not pointer to function")
+	if funcType.Kind() != reflect.Func {
+		log.Fatalf("rabbit: funcPtr of RPC '%v' is not pointer to function", desc.Name)
 	}
 
 	if funcType != hType {
