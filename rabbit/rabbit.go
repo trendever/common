@@ -474,14 +474,14 @@ type Subscription struct {
 	// When exclusive is true, the server will ensure that this is the sole consumer from this queue.
 	Exclusive bool
 	Args      amqp.Table
-	// Run handlers in gorutines. @TODO It does not work yet, do not use...
+	// Run handlers in gorutines.
 	Concurrent bool
 	// With a prefetch count greater than zero, the server will deliver that many messages to consumers before acknowledgments are received.
 	// The server ignores this option when consumers are started with noAck because no acknowledgments are expected or sent.
 	Prefetch int
 
 	// Basic handler. If AutoAck is false, function must call Ack() or Reject() method of delivery before exit.
-	Handler func(delivery amqp.Delivery, ch *amqp.Channel)
+	Handler func(delivery *amqp.Delivery, ch *amqp.Channel)
 	// Easier way: data will be decoded with json.Unmarshal, ack or requeue will be performed based on return value.
 	// Should be func(decodedArg something) bool.
 	// @TODO Do we need a way to reject delivery without requeue? It migh be useful to send it to dead letter exchange.
@@ -505,7 +505,7 @@ func (s *Subscription) prepareHandler() {
 	argType := hType.In(0)
 	hValue := reflect.ValueOf(s.DecodedHandler)
 
-	s.Handler = func(m amqp.Delivery, _ *amqp.Channel) {
+	s.Handler = func(m *amqp.Delivery, _ *amqp.Channel) {
 		if m.ContentType != EncodedTransferContentType {
 			log.Errorf("rabbit: got delivery with unexpected mime type %+v", m.ContentType)
 			if !s.AutoAck {
@@ -566,12 +566,12 @@ func (s *Subscription) connLoop(c conn) {
 			for delivery := range deliveries {
 				if s.Concurrent {
 					c.wait.Add(1)
-					go func() {
-						s.Handler(delivery, ch)
+					go func(delivery amqp.Delivery) {
+						s.Handler(&delivery, ch)
 						c.wait.Done()
-					}()
+					}(delivery)
 				} else {
-					s.Handler(delivery, ch)
+					s.Handler(&delivery, ch)
 				}
 			}
 		}
@@ -617,7 +617,7 @@ func (s *Subscription) prepareChanel(ch *amqp.Channel) (name string, ok bool) {
 	closes := ch.NotifyClose(make(chan *amqp.Error))
 	go func() {
 		for err := range closes {
-			log.Errorf("%+v", err)
+			log.Errorf("rabbit: chanel closed: %+v", err)
 		}
 	}()
 
@@ -658,7 +658,6 @@ type RPC struct {
 	Name        string
 	Timeout     time.Duration
 	QueueLength int
-	// @TODO It does not work yet, do not use...
 	Concurrent  bool
 	HandlerType interface{}
 }
@@ -739,7 +738,7 @@ func ServeRPC(desc RPC, handler interface{}) {
 	hValue := reflect.ValueOf(handler)
 
 	// Dat naming %)
-	realHandler := func(m amqp.Delivery, ch *amqp.Channel) {
+	realHandler := func(m *amqp.Delivery, ch *amqp.Channel) {
 		if m.ContentType != EncodedTransferContentType {
 			log.Errorf("rabbit: rpc '%v' call argiment unexpected mime type %+v", desc.Name, m.ContentType)
 			return
@@ -896,7 +895,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 			return nil
 		},
 
-		Handler: func(delivery amqp.Delivery, ch *amqp.Channel) {
+		Handler: func(delivery *amqp.Delivery, ch *amqp.Channel) {
 			tag, err := strconv.ParseUint(delivery.CorrelationId, 10, 64)
 			if err != nil {
 				log.Errorf("rabbit: invalid correlation id '%v' in reply for RPC '%v'", delivery.CorrelationId, desc.Name)
@@ -928,7 +927,7 @@ func DeclareRPC(desc RPC, funcPtr interface{}) {
 	retType := hType.Out(0)
 	nilErr := reflect.Zero(reflect.TypeOf((*error)(nil)).Elem())
 
-	// Dark reflect magic all round.
+	// Dark reflect magic all around.
 	// https://pbs.twimg.com/media/DEvvvUoUIAEpAbU.jpg
 	call := func(args []reflect.Value) (results []reflect.Value) {
 		// Marshal argument first, no need to resume when it's invalid.
