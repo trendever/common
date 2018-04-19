@@ -8,11 +8,12 @@ import (
 	"time"
 )
 
+var DefaultProxy = ""
+
 // build http.Transport for given proxy URL in scheme://user:password@host:port format
 func TransportFromURL(proxyURL string) (ret *http.Transport, err error) {
 	// mostly copy of http.DefaultTransport
 	ret = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -24,7 +25,11 @@ func TransportFromURL(proxyURL string) (ret *http.Transport, err error) {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	if proxyURL == "" {
-		return
+		if DefaultProxy == "" {
+			ret.Proxy = http.ProxyFromEnvironment
+			return
+		}
+		proxyURL = DefaultProxy
 	}
 	parsed, err := url.Parse(proxyURL)
 	if err != nil {
