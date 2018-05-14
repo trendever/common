@@ -160,8 +160,8 @@ func (r *Router) execute(session Session, msg string) {
 	log.Debug("%s %s | %s -> %s | %s",
 		logPrefix,
 		startTime.Format("2006/01/02 - 15:04:05"),
-		color.GreenString(req.Method),
 		color.YellowString(req.Domain),
+		color.GreenString(req.Method),
 		elapsedTime,
 	)
 }
